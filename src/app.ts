@@ -201,6 +201,7 @@ export function buildApp(
         type: "resolution",
         referenceType: "booking",
         referenceId: booking.id,
+        recipientUserId: booking.resolverUserId,
       });
       const withPayment = await resolutionRepository.setBookingPaymentId(booking.id, paymentId);
 
