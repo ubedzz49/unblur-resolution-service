@@ -4,6 +4,10 @@ export interface CollectPaymentInput {
   type: "resolution";
   referenceType: "booking";
   referenceId: string;
+  // who the 90% payout goes to once the payment is confirmed -- Payment Service has no way to
+  // derive this from referenceType/referenceId alone (it doesn't know about bookings), so the
+  // caller (this service) must supply it
+  recipientUserId: string;
 }
 
 export interface PaymentClient {

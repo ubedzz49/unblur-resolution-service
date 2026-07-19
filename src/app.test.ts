@@ -353,6 +353,7 @@ describe("POST /resolution-requests/:id/accept", () => {
       amountCents: 5000,
       referenceType: "booking",
       referenceId: booking.id,
+      recipientUserId: RESOLVER,
     });
   });
 
