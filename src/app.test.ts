@@ -542,6 +542,22 @@ describe("POST /resolution-requests/:id/reject", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  // regression: real clients (including our own frontend's request() helper) send
+  // Content-Type: application/json on every request regardless of whether there's a body --
+  // Fastify's default JSON parser rejects an empty body when that header is present, which
+  // broke this exact real endpoint (confirmed live via curl before this fix)
+  it("accepts an empty body with Content-Type: application/json set (real client behavior)", async () => {
+    const { app } = setup();
+    const created = await createPendingRequest(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/reject`,
+      headers: { "x-user-id": POSTER, "content-type": "application/json" },
+      payload: "",
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
   it("404s for an unknown id", async () => {
     const { app } = setup();
     const res = await app.inject({

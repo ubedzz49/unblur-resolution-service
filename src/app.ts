@@ -50,6 +50,24 @@ export function buildApp(
     logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
   });
 
+  // Fastify's default JSON parser rejects an empty body when Content-Type: application/json is
+  // set, even for methods like DELETE/POST-with-no-body (accept, reject, complete, cancel all
+  // legitimately have none) -- our own frontend sends that header unconditionally on every
+  // request, so this bites any no-body call otherwise. Confirmed live: a real POST .../reject
+  // with an empty body and Content-Type: application/json failed with FST_ERR_CTP_EMPTY_JSON_BODY
+  // before this fix.
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (_request, body, done) => {
+    if (body === "") {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(body as string));
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  });
+
   app.get("/healthz", async () => ({ status: "ok" }));
 
   // the gateway verifies the caller's JWT and injects this header -- this service never verifies
