@@ -167,7 +167,13 @@ item applies every time, but each one should be a deliberate decision to skip, n
   safely (parameterized queries, no string concatenation) — a literal `'; DROP TABLE` or `<script>`
   style payload in a test input is a legitimate and expected test case, not paranoia.
 - **Empty / null / oversized payloads**: an empty body where one is required, explicit `null` for
-  optional fields, a request body far larger than anything realistic.
+  optional fields, a request body far larger than anything realistic. For any no-body endpoint
+  (DELETE, or a POST/PATCH action route with nothing to send), test it with `Content-Type:
+  application/json` explicitly set alongside the empty body — real browser/`fetch` clients send
+  that header unconditionally regardless of body, and Fastify's default JSON parser rejects an
+  empty body whenever it's present. A `curl` without the header, or an `inject()` test that omits
+  it, will not catch this — it was a real, live bug across multiple services before this rule
+  existed (see `ARCHITECTURE_DECISIONS.md`).
 - **Duplicate / concurrent requests** where relevant: double-submitting the same create/mutate
   request (idempotency), two requests racing to change the same row.
 - **Negative case for every validation rule** — if a rule says "X is required," there must be a
