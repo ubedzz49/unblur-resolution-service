@@ -2,12 +2,16 @@ import Fastify, { FastifyInstance, FastifyRequest } from "fastify";
 import { DoubtClient, FakeDoubtClient } from "./doubts/client.js";
 import { FakePaymentClient, PaymentClient } from "./payments/client.js";
 import { FakeStatsClient, StatsClient } from "./stats/client.js";
+import { FakeMeetingClient, MeetingClient } from "./meetings/client.js";
+import { FakeNotificationClient, NotificationClient } from "./notifications/client.js";
 import {
   Booking,
   BookingFilters,
   BookingStatus,
   DuplicateAcceptedRequestError,
+  DuplicateRatingError,
   InMemoryResolutionRepository,
+  Rating,
   ResolutionRepository,
   ResolutionRequestFilters,
   ResolutionRequestStatus,
@@ -24,6 +28,11 @@ interface CreateRequestBody {
 
 interface AcceptRequestBody {
   chosenSlot?: string;
+}
+
+interface RateBookingBody {
+  rating?: number;
+  feedbackText?: string;
 }
 
 interface ListRequestsQuery {
@@ -45,6 +54,8 @@ export function buildApp(
   doubtClient: DoubtClient = new FakeDoubtClient(),
   paymentClient: PaymentClient = new FakePaymentClient(),
   statsClient: StatsClient = new FakeStatsClient(),
+  meetingClient: MeetingClient = new FakeMeetingClient(),
+  notificationClient: NotificationClient = new FakeNotificationClient(),
 ): FastifyInstance {
   const app = Fastify({
     logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
@@ -134,6 +145,19 @@ export function buildApp(
       amountCents,
       proposedSlots: validSlots,
     });
+    try {
+      await notificationClient.notify({
+        userId: doubt.authorUserId,
+        type: "resolution_request_received",
+        referenceType: "resolutionRequest",
+        referenceId: created.id,
+        title: "New resolution request",
+        body: "Someone sent a resolution request for your doubt",
+      });
+    } catch (err) {
+      request.log.warn({ requestId: created.id, err }, "notification failed, request still created");
+    }
+
     request.log.info({ requestId: created.id, doubtId }, "resolution request created");
     return reply.code(201).send(created);
   });
@@ -223,8 +247,31 @@ export function buildApp(
       });
       const withPayment = await resolutionRepository.setBookingPaymentId(booking.id, paymentId);
 
+      // meeting room creation follows the same "no silent fallback" rule as payment collection --
+      // a booking with no real room is a real problem, so this throws and the whole accept fails
+      // rather than returning a booking with no joinUrl
+      const room = await meetingClient.createRoom({
+        referenceId: booking.id,
+        durationMins: resolutionRequest.durationMins,
+      });
+      const withMeeting = await resolutionRepository.setBookingMeetingInfo(booking.id, room.providerRoomId, room.joinUrl);
+
+      const finalBooking = withMeeting ?? { ...(withPayment ?? { ...booking, paymentId }), providerRoomId: room.providerRoomId, joinUrl: room.joinUrl };
+
+      try {
+        await notificationClient.notify({
+          userId: resolutionRequest.resolverUserId,
+          type: "resolution_request_accepted",
+          referenceType: "booking",
+          referenceId: booking.id,
+          title: "Your request was accepted",
+        });
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "notification failed, booking still accepted");
+      }
+
       request.log.info({ bookingId: booking.id, requestId: resolutionRequest.id }, "resolution request accepted");
-      return reply.send(withPayment ?? { ...booking, paymentId });
+      return reply.send(finalBooking);
     },
   );
 
@@ -253,6 +300,19 @@ export function buildApp(
     }
 
     const updated = await resolutionRepository.rejectRequest(resolutionRequest.id);
+
+    try {
+      await notificationClient.notify({
+        userId: resolutionRequest.resolverUserId,
+        type: "resolution_request_rejected",
+        referenceType: "resolutionRequest",
+        referenceId: resolutionRequest.id,
+        title: "Your request was rejected",
+      });
+    } catch (err) {
+      request.log.warn({ requestId: resolutionRequest.id, err }, "notification failed, request still rejected");
+    }
+
     request.log.info({ requestId: resolutionRequest.id }, "resolution request rejected");
     return reply.send(updated);
   });
@@ -326,8 +386,103 @@ export function buildApp(
       request.log.warn({ bookingId: booking.id, err }, "stats update failed, booking still completed");
     }
 
+    // same graceful-degradation rule as stats -- tearing down the room is cleanup, not a
+    // reason to fail a completion that already happened
+    if (booking.providerRoomId) {
+      try {
+        await meetingClient.endRoom(booking.providerRoomId);
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "ending meeting room failed, booking still completed");
+      }
+    }
+
+    for (const userId of [booking.posterUserId, booking.resolverUserId]) {
+      try {
+        await notificationClient.notify({
+          userId,
+          type: "booking_completed",
+          referenceType: "booking",
+          referenceId: booking.id,
+          title: "Session completed",
+        });
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, userId, err }, "notification failed, booking still completed");
+      }
+    }
+
     request.log.info({ bookingId: booking.id }, "booking completed");
     return reply.send(updated);
+  });
+
+  app.post<{ Params: { id: string }; Body: RateBookingBody }>("/bookings/:id/rate", async (request, reply) => {
+    const callerUserId = requireUserId(request);
+    if (!callerUserId) {
+      return reply.code(401).send({ error: "missing X-User-Id header" });
+    }
+
+    const booking = await resolutionRepository.getBookingById(request.params.id);
+    if (!booking) {
+      return reply.code(404).send({ error: "booking not found" });
+    }
+
+    // only the poster rates the session -- the resolver rating their own session doesn't make
+    // sense here, same as any other ownership check in this file
+    if (booking.posterUserId !== callerUserId) {
+      return reply.code(403).send({ error: "only the booking's poster can rate this session" });
+    }
+
+    const { rating, feedbackText } = request.body ?? {};
+    if (rating === undefined || !Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return reply.code(400).send({ error: "rating must be an integer between 1 and 5" });
+    }
+    if (feedbackText !== undefined && typeof feedbackText !== "string") {
+      return reply.code(400).send({ error: "feedbackText must be a string" });
+    }
+
+    if (booking.status !== "completed") {
+      return reply.code(409).send({ error: `booking is ${booking.status}, not completed yet` });
+    }
+
+    let created: Rating;
+    try {
+      created = await resolutionRepository.createRating({
+        bookingId: booking.id,
+        raterUserId: callerUserId,
+        ratedUserId: booking.resolverUserId,
+        rating,
+        feedbackText: feedbackText ?? null,
+      });
+    } catch (err) {
+      // relies on the DB's unique index on booking_id to actually catch this race -- app-layer
+      // check-then-insert alone can't close the gap between two concurrent rate calls
+      if (err instanceof DuplicateRatingError) {
+        return reply.code(409).send({ error: "booking has already been rated" });
+      }
+      throw err;
+    }
+
+    // matches the stats-increment precedent in complete -- a rating that doesn't update the
+    // resolver's average is a data-quality gap, not a reason to fail the rating itself
+    try {
+      await statsClient.recordRating(booking.resolverUserId, rating);
+    } catch (err) {
+      request.log.warn({ bookingId: booking.id, err }, "recording rating stat failed, rating still saved");
+    }
+
+    try {
+      await notificationClient.notify({
+        userId: booking.resolverUserId,
+        type: "rating_received",
+        referenceType: "rating",
+        referenceId: created.id,
+        title: "You got a rating",
+      });
+    } catch (err) {
+      request.log.warn({ ratingId: created.id, err }, "notification failed, rating still saved");
+    }
+
+    request.log.info({ bookingId: booking.id, ratingId: created.id }, "booking rated");
+    return reply.code(201).send(created);
   });
 
   app.post<{ Params: { id: string } }>("/bookings/:id/cancel", async (request, reply) => {

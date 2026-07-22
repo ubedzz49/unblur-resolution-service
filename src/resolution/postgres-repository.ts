@@ -4,8 +4,11 @@ import {
   BookingFilters,
   BookingStatus,
   CreateBookingInput,
+  CreateRatingInput,
   CreateResolutionRequestInput,
   DuplicateAcceptedRequestError,
+  DuplicateRatingError,
+  Rating,
   ResolutionRepository,
   ResolutionRequest,
   ResolutionRequestFilters,
@@ -39,8 +42,20 @@ interface BookingRow {
   duration_mins: number;
   amount_cents: number;
   payment_id: string | null;
+  provider_room_id: string | null;
+  join_url: string | null;
   status: BookingStatus;
   completed_at: string | null;
+  created_at: string;
+}
+
+interface RatingRow {
+  id: string;
+  booking_id: string;
+  rater_user_id: string;
+  rated_user_id: string;
+  rating: number;
+  feedback_text: string | null;
   created_at: string;
 }
 
@@ -70,8 +85,22 @@ function toBooking(row: BookingRow): Booking {
     durationMins: row.duration_mins,
     amountCents: row.amount_cents,
     paymentId: row.payment_id,
+    providerRoomId: row.provider_room_id,
+    joinUrl: row.join_url,
     status: row.status,
     completedAt: row.completed_at,
+    createdAt: row.created_at,
+  };
+}
+
+function toRating(row: RatingRow): Rating {
+  return {
+    id: row.id,
+    bookingId: row.booking_id,
+    raterUserId: row.rater_user_id,
+    ratedUserId: row.rated_user_id,
+    rating: row.rating,
+    feedbackText: row.feedback_text,
     createdAt: row.created_at,
   };
 }
@@ -181,6 +210,14 @@ export class PostgresResolutionRepository implements ResolutionRepository {
     return result.rows[0] ? toBooking(result.rows[0]) : null;
   }
 
+  async setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null> {
+    const result = await this.pool.query<BookingRow>(
+      `UPDATE bookings SET provider_room_id = $2, join_url = $3 WHERE id = $1 RETURNING *`,
+      [bookingId, providerRoomId, joinUrl],
+    );
+    return result.rows[0] ? toBooking(result.rows[0]) : null;
+  }
+
   async getBookingById(id: string): Promise<Booking | null> {
     const result = await this.pool.query<BookingRow>(`SELECT * FROM bookings WHERE id = $1`, [id]);
     return result.rows[0] ? toBooking(result.rows[0]) : null;
@@ -222,6 +259,25 @@ export class PostgresResolutionRepository implements ResolutionRepository {
       [id],
     );
     return result.rows[0] ? toBooking(result.rows[0]) : null;
+  }
+
+  async createRating(input: CreateRatingInput): Promise<Rating> {
+    try {
+      const result = await this.pool.query<RatingRow>(
+        `INSERT INTO ratings (booking_id, rater_user_id, rated_user_id, rating, feedback_text)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING *`,
+        [input.bookingId, input.raterUserId, input.ratedUserId, input.rating, input.feedbackText],
+      );
+      return toRating(result.rows[0]);
+    } catch (err) {
+      // the unique index on ratings.booking_id rejects a second rating for the same booking --
+      // turn that into a typed error, not a raw pg error
+      if (isUniqueViolation(err)) {
+        throw new DuplicateRatingError(input.bookingId);
+      }
+      throw err;
+    }
   }
 }
 
