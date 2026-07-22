@@ -32,9 +32,29 @@ export interface Booking {
   durationMins: number;
   amountCents: number;
   paymentId: string | null;
+  providerRoomId: string | null;
+  joinUrl: string | null;
   status: BookingStatus;
   completedAt: string | null;
   createdAt: string;
+}
+
+export interface Rating {
+  id: string;
+  bookingId: string;
+  raterUserId: string;
+  ratedUserId: string;
+  rating: number;
+  feedbackText: string | null;
+  createdAt: string;
+}
+
+export interface CreateRatingInput {
+  bookingId: string;
+  raterUserId: string;
+  ratedUserId: string;
+  rating: number;
+  feedbackText: string | null;
 }
 
 export interface CreateBookingInput {
@@ -68,6 +88,15 @@ export class DuplicateAcceptedRequestError extends Error {
   }
 }
 
+// thrown by createRating when the DB's unique index on bookings.id (one rating per booking)
+// rejects the write -- callers turn this into a clean 409, never a raw DB error
+export class DuplicateRatingError extends Error {
+  constructor(bookingId: string) {
+    super(`booking ${bookingId} has already been rated`);
+    this.name = "DuplicateRatingError";
+  }
+}
+
 export interface ResolutionRepository {
   createRequest(input: CreateResolutionRequestInput): Promise<ResolutionRequest>;
   getRequestById(id: string): Promise<ResolutionRequest | null>;
@@ -77,16 +106,21 @@ export interface ResolutionRepository {
   acceptRequest(requestId: string, chosenSlot: string, booking: CreateBookingInput): Promise<Booking>;
   rejectRequest(id: string): Promise<ResolutionRequest | null>;
   setBookingPaymentId(bookingId: string, paymentId: string): Promise<Booking | null>;
+  setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null>;
   getBookingById(id: string): Promise<Booking | null>;
   listBookings(filters: BookingFilters): Promise<Booking[]>;
   completeBooking(id: string): Promise<Booking | null>;
   cancelBooking(id: string): Promise<Booking | null>;
+  // throws DuplicateRatingError if the booking already has a rating
+  createRating(input: CreateRatingInput): Promise<Rating>;
 }
 
 // test-only -- avoids CI needing real Postgres
 export class InMemoryResolutionRepository implements ResolutionRepository {
   private requests = new Map<string, ResolutionRequest>();
   private bookings = new Map<string, Booking>();
+  // mirrors the DB's unique index on ratings.booking_id
+  private ratingsByBooking = new Map<string, Rating>();
 
   async createRequest(input: CreateResolutionRequestInput): Promise<ResolutionRequest> {
     const now = new Date().toISOString();
@@ -151,6 +185,8 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
       durationMins: bookingInput.durationMins,
       amountCents: bookingInput.amountCents,
       paymentId: null,
+      providerRoomId: null,
+      joinUrl: null,
       status: "scheduled",
       completedAt: null,
       createdAt: now,
@@ -171,6 +207,14 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
     const existing = this.bookings.get(bookingId);
     if (!existing) return null;
     const updated: Booking = { ...existing, paymentId };
+    this.bookings.set(bookingId, updated);
+    return updated;
+  }
+
+  async setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null> {
+    const existing = this.bookings.get(bookingId);
+    if (!existing) return null;
+    const updated: Booking = { ...existing, providerRoomId, joinUrl };
     this.bookings.set(bookingId, updated);
     return updated;
   }
@@ -201,5 +245,22 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
     const updated: Booking = { ...existing, status: "cancelled" };
     this.bookings.set(id, updated);
     return updated;
+  }
+
+  async createRating(input: CreateRatingInput): Promise<Rating> {
+    if (this.ratingsByBooking.has(input.bookingId)) {
+      throw new DuplicateRatingError(input.bookingId);
+    }
+    const rating: Rating = {
+      id: crypto.randomUUID(),
+      bookingId: input.bookingId,
+      raterUserId: input.raterUserId,
+      ratedUserId: input.ratedUserId,
+      rating: input.rating,
+      feedbackText: input.feedbackText,
+      createdAt: new Date().toISOString(),
+    };
+    this.ratingsByBooking.set(input.bookingId, rating);
+    return rating;
   }
 }

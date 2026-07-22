@@ -5,6 +5,8 @@ import { PostgresResolutionRepository } from "./resolution/postgres-repository.j
 import { HttpDoubtClient } from "./doubts/client.js";
 import { HttpPaymentClient } from "./payments/client.js";
 import { HttpStatsClient } from "./stats/client.js";
+import { HttpMeetingClient } from "./meetings/client.js";
+import { HttpNotificationClient } from "./notifications/client.js";
 import { logger } from "./logger.js";
 
 const port = Number(process.env.PORT ?? 3005);
@@ -17,6 +19,8 @@ runMigrations(dbPool)
       new HttpDoubtClient(),
       new HttpPaymentClient(),
       new HttpStatsClient(),
+      new HttpMeetingClient(),
+      new HttpNotificationClient(),
     );
     return app.listen({ port, host: "0.0.0.0" }).then(() => app.log.info({ port }, "resolution-service listening"));
   })

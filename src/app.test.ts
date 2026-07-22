@@ -3,6 +3,13 @@ import { buildApp } from "./app.js";
 import { Doubt, DoubtClient, FakeDoubtClient } from "./doubts/client.js";
 import { FakePaymentClient, PaymentClient } from "./payments/client.js";
 import { FakeStatsClient, StatsClient, ThrowingStatsClient } from "./stats/client.js";
+import {
+  FakeMeetingClient,
+  MeetingClient,
+  ThrowingCreateMeetingClient,
+  ThrowingEndMeetingClient,
+} from "./meetings/client.js";
+import { FakeNotificationClient, NotificationClient, ThrowingNotificationClient } from "./notifications/client.js";
 import { InMemoryResolutionRepository } from "./resolution/repository.js";
 
 const POSTER = "11111111-1111-1111-1111-111111111111";
@@ -39,8 +46,10 @@ function setup(opts: { doubt?: Doubt | null } = {}) {
   }
   const paymentClient = new FakePaymentClient();
   const statsClient = new FakeStatsClient();
-  const app = buildApp(repo, doubtClient, paymentClient, statsClient);
-  return { app, repo, doubtClient, paymentClient, statsClient };
+  const meetingClient = new FakeMeetingClient();
+  const notificationClient = new FakeNotificationClient();
+  const app = buildApp(repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient);
+  return { app, repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient };
 }
 
 const validCreateBody = () => ({
@@ -69,6 +78,7 @@ describe("auth: X-User-Id header", () => {
       { method: "GET", url: "/bookings/my?role=poster" },
       { method: "POST", url: "/bookings/some-id/complete" },
       { method: "POST", url: "/bookings/some-id/cancel" },
+      { method: "POST", url: "/bookings/some-id/rate" },
     ];
     for (const route of routes) {
       const res = await app.inject({ method: route.method, url: route.url, payload: {} });
@@ -92,6 +102,46 @@ describe("POST /resolution-requests", () => {
     expect(body.status).toBe("pending");
     expect(body.resolverUserId).toBe(RESOLVER);
     expect(body.doubtId).toBe(DOUBT_ID);
+  });
+
+  it("notifies the doubt's poster that a resolution request came in", async () => {
+    const { app, notificationClient } = setup();
+    const res = await app.inject({
+      method: "POST",
+      url: "/resolution-requests",
+      headers: { "x-user-id": RESOLVER },
+      payload: validCreateBody(),
+    });
+    const created = res.json();
+    expect(notificationClient.calls).toContainEqual(
+      expect.objectContaining({
+        userId: POSTER,
+        type: "resolution_request_received",
+        referenceType: "resolutionRequest",
+        referenceId: created.id,
+      }),
+    );
+  });
+
+  it("a notification failure does NOT block request creation from succeeding", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      new ThrowingNotificationClient(),
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/resolution-requests",
+      headers: { "x-user-id": RESOLVER },
+      payload: validCreateBody(),
+    });
+    expect(res.statusCode).toBe(201);
   });
 
   it("404s when the doubt doesn't exist", async () => {
@@ -327,8 +377,8 @@ async function createPendingRequest(
 }
 
 describe("POST /resolution-requests/:id/accept", () => {
-  it("accepts, closes the doubt, creates a booking with a paymentId", async () => {
-    const { app, doubtClient, paymentClient } = setup();
+  it("accepts, closes the doubt, creates a booking with a paymentId and a real joinUrl", async () => {
+    const { app, doubtClient, paymentClient, meetingClient } = setup();
     const slot = futureSlot();
     const created = await createPendingRequest(app, { proposedSlots: [slot] });
 
@@ -344,6 +394,7 @@ describe("POST /resolution-requests/:id/accept", () => {
     expect(booking.paymentId).toBeTruthy();
     expect(booking.posterUserId).toBe(POSTER);
     expect(booking.resolverUserId).toBe(RESOLVER);
+    expect(booking.joinUrl).toBeTruthy();
 
     const doubt = await doubtClient.getDoubt(DOUBT_ID);
     expect(doubt?.status).toBe("closed");
@@ -355,6 +406,105 @@ describe("POST /resolution-requests/:id/accept", () => {
       referenceId: booking.id,
       recipientUserId: RESOLVER,
     });
+    expect(meetingClient.createCalls).toHaveLength(1);
+    expect(meetingClient.createCalls[0]).toMatchObject({ referenceId: booking.id, durationMins: 30 });
+  });
+
+  it("stores the joinUrl on the booking so it's also visible via GET /bookings/:id and /bookings/my", async () => {
+    const { app } = setup();
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+    const acceptRes = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    const booking = acceptRes.json();
+
+    const getRes = await app.inject({
+      method: "GET",
+      url: `/bookings/${booking.id}`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(getRes.json().joinUrl).toBe(booking.joinUrl);
+
+    const listRes = await app.inject({
+      method: "GET",
+      url: "/bookings/my?role=poster",
+      headers: { "x-user-id": POSTER },
+    });
+    expect(listRes.json()[0].joinUrl).toBe(booking.joinUrl);
+  });
+
+  it("fails cleanly (no silent booking-without-a-room) when meeting room creation throws", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new ThrowingCreateMeetingClient(),
+      new FakeNotificationClient(),
+    );
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    expect(res.statusCode).toBe(500);
+  });
+
+  it("a notification failure does NOT block accept from succeeding", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      new ThrowingNotificationClient(),
+    );
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("scheduled");
+  });
+
+  it("notifies the resolver that their request was accepted", async () => {
+    const { app, notificationClient } = setup();
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+    const res = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    const booking = res.json();
+    expect(notificationClient.calls).toContainEqual(
+      expect.objectContaining({
+        userId: RESOLVER,
+        type: "resolution_request_accepted",
+        referenceType: "booking",
+        referenceId: booking.id,
+      }),
+    );
   });
 
   it("403s when the caller is not the doubt's author", async () => {
@@ -558,6 +708,24 @@ describe("POST /resolution-requests/:id/reject", () => {
     expect(res.statusCode).toBe(200);
   });
 
+  it("notifies the resolver that their request was rejected", async () => {
+    const { app, notificationClient } = setup();
+    const created = await createPendingRequest(app);
+    await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/reject`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(notificationClient.calls).toContainEqual(
+      expect.objectContaining({
+        userId: RESOLVER,
+        type: "resolution_request_rejected",
+        referenceType: "resolutionRequest",
+        referenceId: created.id,
+      }),
+    );
+  });
+
   it("404s for an unknown id", async () => {
     const { app } = setup();
     const res = await app.inject({
@@ -706,8 +874,8 @@ describe("GET /bookings/my", () => {
 });
 
 describe("POST /bookings/:id/complete", () => {
-  it("marks completed and calls stats client", async () => {
-    const { app, statsClient } = setup();
+  it("marks completed, calls stats client and ends the meeting room", async () => {
+    const { app, statsClient, meetingClient } = setup();
     const booking = await acceptAndBook(app);
     const res = await app.inject({
       method: "POST",
@@ -717,6 +885,67 @@ describe("POST /bookings/:id/complete", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("completed");
     expect(statsClient.calls).toEqual([{ userId: RESOLVER, minutes: booking.durationMins }]);
+    expect(meetingClient.endCalls).toEqual([booking.providerRoomId]);
+  });
+
+  it("notifies both poster and resolver that the session completed", async () => {
+    const { app, notificationClient } = setup();
+    const booking = await acceptAndBook(app);
+    await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    const completedNotifications = notificationClient.calls.filter((c) => c.type === "booking_completed");
+    expect(completedNotifications).toHaveLength(2);
+    expect(completedNotifications.map((c) => c.userId).sort()).toEqual([POSTER, RESOLVER].sort());
+    for (const n of completedNotifications) {
+      expect(n).toMatchObject({ referenceType: "booking", referenceId: booking.id });
+    }
+  });
+
+  it("a notification failure does NOT block completion from succeeding", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      new ThrowingNotificationClient(),
+    );
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("completed");
+  });
+
+  it("an end-room failure does NOT block booking completion", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new ThrowingEndMeetingClient(),
+      new FakeNotificationClient(),
+    );
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("completed");
   });
 
   it("403s for a third party", async () => {
@@ -857,6 +1086,307 @@ describe("POST /bookings/:id/cancel", () => {
 
     const stillScheduled = await repo.getBookingById(booking.id);
     expect(stillScheduled?.status).toBe("scheduled");
+  });
+});
+
+async function acceptBookAndComplete(app: ReturnType<typeof buildApp>) {
+  const booking = await acceptAndBook(app);
+  const res = await app.inject({
+    method: "POST",
+    url: `/bookings/${booking.id}/complete`,
+    headers: { "x-user-id": POSTER },
+  });
+  return res.json();
+}
+
+describe("POST /bookings/:id/rate", () => {
+  it("the poster rates a completed session", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5, feedbackText: "great session" },
+    });
+    expect(res.statusCode).toBe(201);
+    const rating = res.json();
+    expect(rating.rating).toBe(5);
+    expect(rating.bookingId).toBe(booking.id);
+    expect(rating.raterUserId).toBe(POSTER);
+    expect(rating.ratedUserId).toBe(RESOLVER);
+    expect(rating.feedbackText).toBe("great session");
+  });
+
+  it("omits feedbackText fine (optional field)", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 3 },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().feedbackText).toBeNull();
+  });
+
+  it("calls the stats client to record the rating and notifies the resolver", async () => {
+    const { app, statsClient, notificationClient } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 4 },
+    });
+    const rating = res.json();
+    expect(statsClient.ratingCalls).toEqual([{ userId: RESOLVER, rating: 4 }]);
+    expect(notificationClient.calls).toContainEqual(
+      expect.objectContaining({
+        userId: RESOLVER,
+        type: "rating_received",
+        referenceType: "rating",
+        referenceId: rating.id,
+      }),
+    );
+  });
+
+  it("403s a random third party trying to rate", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": OTHER_USER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("403s the resolver trying to rate their own session -- a real ownership test, not just the third-party case", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": RESOLVER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("404s for an unknown booking id", async () => {
+    const { app } = setup();
+    const res = await app.inject({
+      method: "POST",
+      url: "/bookings/does-not-exist/rate",
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("409s rating a booking that isn't completed yet", async () => {
+    const { app } = setup();
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("409s rating a cancelled booking", async () => {
+    const { app } = setup();
+    const booking = await acceptAndBook(app);
+    await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/cancel`,
+      headers: { "x-user-id": POSTER },
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("409s a second rating attempt on the same booking -- proving the DB unique constraint is what catches it, not just app-layer state", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const first = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(first.statusCode).toBe(201);
+
+    const second = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 2 },
+    });
+    expect(second.statusCode).toBe(409);
+  });
+
+  describe("rating boundaries", () => {
+    it("accepts 1", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: { rating: 1 },
+      });
+      expect(res.statusCode).toBe(201);
+    });
+
+    it("accepts 5", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: { rating: 5 },
+      });
+      expect(res.statusCode).toBe(201);
+    });
+
+    it("rejects 0", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: { rating: 0 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects 6", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: { rating: 6 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a non-integer rating", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: { rating: 3.5 },
+      });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it("rejects a missing rating", async () => {
+      const { app } = setup();
+      const booking = await acceptBookAndComplete(app);
+      const res = await app.inject({
+        method: "POST",
+        url: `/bookings/${booking.id}/rate`,
+        headers: { "x-user-id": POSTER },
+        payload: {},
+      });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  it("400s a non-string feedbackText", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5, feedbackText: 12345 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("401s when the header is missing", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("accepts an empty body with Content-Type: application/json set, and 400s cleanly (not a crash) since rating is required", async () => {
+    const { app } = setup();
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER, "content-type": "application/json" },
+      payload: "",
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("a stats-record failure does NOT block the rating from being saved", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new ThrowingStatsClient(),
+      new FakeMeetingClient(),
+      new FakeNotificationClient(),
+    );
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("a notification failure does NOT block the rating from being saved", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      new ThrowingNotificationClient(),
+    );
+    const booking = await acceptBookAndComplete(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/rate`,
+      headers: { "x-user-id": POSTER },
+      payload: { rating: 5 },
+    });
+    expect(res.statusCode).toBe(201);
   });
 });
 

@@ -2,6 +2,7 @@ import { logger } from "../logger.js";
 
 export interface StatsClient {
   incrementMinutesResolved(userId: string, minutes: number): Promise<void>;
+  recordRating(userId: string, rating: number): Promise<void>;
 }
 
 const REQUEST_TIMEOUT_MS = 2000;
@@ -42,20 +43,53 @@ export class HttpStatsClient implements StatsClient {
       clearTimeout(timeout);
     }
   }
+
+  async recordRating(userId: string, rating: number): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const url = new URL(`/internal/users/${userId}/stats/record-rating`, this.baseUrl);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Internal-Service-Token": this.internalToken,
+        },
+        body: JSON.stringify({ rating }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        logger.warn({ userId, status: res.status }, "user service returned non-ok recording rating, ignoring");
+      }
+    } catch (err) {
+      logger.warn({ userId, err }, "user service call failed or timed out recording rating, ignoring");
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 // test-only
 export class FakeStatsClient implements StatsClient {
   public calls: Array<{ userId: string; minutes: number }> = [];
+  public ratingCalls: Array<{ userId: string; rating: number }> = [];
 
   async incrementMinutesResolved(userId: string, minutes: number): Promise<void> {
     this.calls.push({ userId, minutes });
   }
+
+  async recordRating(userId: string, rating: number): Promise<void> {
+    this.ratingCalls.push({ userId, rating });
+  }
 }
 
-// test-only -- simulates the failure path to prove completion isn't blocked by it
+// test-only -- simulates the failure path to prove completion/rating isn't blocked by it
 export class ThrowingStatsClient implements StatsClient {
   async incrementMinutesResolved(): Promise<void> {
+    throw new Error("stats service unreachable");
+  }
+
+  async recordRating(): Promise<void> {
     throw new Error("stats service unreachable");
   }
 }
