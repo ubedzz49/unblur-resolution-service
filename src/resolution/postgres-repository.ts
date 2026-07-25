@@ -44,6 +44,9 @@ interface BookingRow {
   payment_id: string | null;
   provider_room_id: string | null;
   join_url: string | null;
+  resolver_join_url: string | null;
+  attended_seconds: number | null;
+  attendance_ratio: string | null;
   status: BookingStatus;
   completed_at: string | null;
   created_at: string;
@@ -87,6 +90,10 @@ function toBooking(row: BookingRow): Booking {
     paymentId: row.payment_id,
     providerRoomId: row.provider_room_id,
     joinUrl: row.join_url,
+    resolverJoinUrl: row.resolver_join_url,
+    attendedSeconds: row.attended_seconds,
+    // pg returns NUMERIC as a string to avoid float precision surprises -- parse it back here
+    attendanceRatio: row.attendance_ratio === null ? null : Number(row.attendance_ratio),
     status: row.status,
     completedAt: row.completed_at,
     createdAt: row.created_at,
@@ -210,10 +217,23 @@ export class PostgresResolutionRepository implements ResolutionRepository {
     return result.rows[0] ? toBooking(result.rows[0]) : null;
   }
 
-  async setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null> {
+  async setBookingMeetingInfo(
+    bookingId: string,
+    providerRoomId: string,
+    joinUrl: string,
+    resolverJoinUrl: string,
+  ): Promise<Booking | null> {
     const result = await this.pool.query<BookingRow>(
-      `UPDATE bookings SET provider_room_id = $2, join_url = $3 WHERE id = $1 RETURNING *`,
-      [bookingId, providerRoomId, joinUrl],
+      `UPDATE bookings SET provider_room_id = $2, join_url = $3, resolver_join_url = $4 WHERE id = $1 RETURNING *`,
+      [bookingId, providerRoomId, joinUrl, resolverJoinUrl],
+    );
+    return result.rows[0] ? toBooking(result.rows[0]) : null;
+  }
+
+  async setBookingAttendance(bookingId: string, attendedSeconds: number, attendanceRatio: number): Promise<Booking | null> {
+    const result = await this.pool.query<BookingRow>(
+      `UPDATE bookings SET attended_seconds = $2, attendance_ratio = $3 WHERE id = $1 RETURNING *`,
+      [bookingId, attendedSeconds, attendanceRatio],
     );
     return result.rows[0] ? toBooking(result.rows[0]) : null;
   }
