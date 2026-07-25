@@ -845,6 +845,18 @@ describe("GET /bookings/:id", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it("200s for a caller with X-User-Role: admin, even though they're not a party to the booking", async () => {
+    const { app } = setup();
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "GET",
+      url: `/bookings/${booking.id}`,
+      headers: { "x-user-id": OTHER_USER, "x-user-role": "admin" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().id).toBe(booking.id);
+  });
+
   it("404s for an unknown booking id", async () => {
     const { app } = setup();
     const res = await app.inject({

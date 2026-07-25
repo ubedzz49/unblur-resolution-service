@@ -105,6 +105,13 @@ export function buildApp(
     return userId;
   }
 
+  // trusts the gateway-forwarded role header the same way every X-User-Id check already trusts
+  // gateway-verified identity -- used to let the admin dashboard (via Recording Service, looking
+  // up a complaint's recording) read a booking it isn't a party to
+  function isAdminCaller(request: FastifyRequest): boolean {
+    return request.headers["x-user-role"] === "admin";
+  }
+
   function validateSlots(slots: unknown): string[] | null {
     if (!Array.isArray(slots) || slots.length === 0) return null;
     const now = Date.now();
@@ -367,7 +374,7 @@ export function buildApp(
       return reply.code(404).send({ error: "booking not found" });
     }
 
-    if (booking.posterUserId !== callerUserId && booking.resolverUserId !== callerUserId) {
+    if (booking.posterUserId !== callerUserId && booking.resolverUserId !== callerUserId && !isAdminCaller(request)) {
       return reply.code(403).send({ error: "not authorized to view this booking" });
     }
 
