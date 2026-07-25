@@ -920,9 +920,10 @@ describe("GET /bookings/my", () => {
 });
 
 describe("POST /bookings/:id/complete", () => {
-  it("marks completed, calls stats client and ends the meeting room", async () => {
+  it("marks completed, calls stats client and ends the meeting room (full attendance)", async () => {
     const { app, statsClient, meetingClient } = setup();
     const booking = await acceptAndBook(app);
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, booking.durationMins * 60);
     const res = await app.inject({
       method: "POST",
       url: `/bookings/${booking.id}/complete`,
@@ -1031,19 +1032,27 @@ describe("POST /bookings/:id/complete", () => {
     expect(res.statusCode).toBe(409);
   });
 
-  it("releases the payout when the resolver attended at least 90% of the booked duration", async () => {
+  it("holds the payout (for the complaint window) when the resolver attended at least 90% of the booked duration", async () => {
     const { app, paymentClient, meetingClient } = setup();
     const booking = await acceptAndBook(app);
     meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, Math.ceil(booking.durationMins * 60 * 0.9));
 
+    const before = Date.now();
     const res = await app.inject({
       method: "POST",
       url: `/bookings/${booking.id}/complete`,
       headers: { "x-user-id": POSTER },
     });
+    const after = Date.now();
     expect(res.statusCode).toBe(200);
     expect(res.json().attendanceRatio).toBeGreaterThanOrEqual(0.9);
-    expect(paymentClient.releasePayoutCalls).toEqual([{ paymentId: booking.paymentId, decision: "release" }]);
+    expect(paymentClient.releasePayoutCalls).toHaveLength(1);
+    expect(paymentClient.releasePayoutCalls[0].paymentId).toBe(booking.paymentId);
+    expect(paymentClient.releasePayoutCalls[0].decision).toBe("hold");
+    const holdUntilMs = new Date(paymentClient.releasePayoutCalls[0].holdUntil!).getTime();
+    // 30 minute hold window, allow for test execution time drift
+    expect(holdUntilMs).toBeGreaterThanOrEqual(before + 30 * 60_000);
+    expect(holdUntilMs).toBeLessThanOrEqual(after + 30 * 60_000 + 1000);
   });
 
   it("withholds the payout when the resolver attended under 90% of the booked duration", async () => {
@@ -1110,8 +1119,13 @@ describe("POST /bookings/:id/complete", () => {
     const repo = new InMemoryResolutionRepository();
     const doubtClient = new FakeDoubtClient();
     doubtClient.seed(openDoubt());
-    const app = buildApp(repo, doubtClient, new FakePaymentClient(), new ThrowingStatsClient());
+    const meetingClient = new FakeMeetingClient();
+    const app = buildApp(repo, doubtClient, new FakePaymentClient(), new ThrowingStatsClient(), meetingClient);
     const booking = await acceptAndBook(app);
+    // full attendance so the stats call is actually attempted (and throws), exercising the
+    // asymmetry this test is named for -- under the discount rule, under-attendance skips the
+    // stats call entirely rather than attempting and failing it
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, booking.durationMins * 60);
 
     const res = await app.inject({
       method: "POST",
@@ -1120,6 +1134,20 @@ describe("POST /bookings/:id/complete", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json().status).toBe("completed");
+  });
+
+  it("skips the minutesResolved credit entirely when attendance is under 90% (under-time discount rule)", async () => {
+    const { app, statsClient, meetingClient } = setup();
+    const booking = await acceptAndBook(app);
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, Math.floor(booking.durationMins * 60 * 0.5));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(statsClient.calls).toEqual([]);
   });
 });
 

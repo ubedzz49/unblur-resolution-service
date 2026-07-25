@@ -22,6 +22,9 @@ const MAX_DURATION_MINS = 480;
 // withheld rather than released -- prevents a resolver from banking paid minutes for a session
 // they barely attended
 const MIN_ATTENDANCE_RATIO = 0.9;
+// released payouts sit held for this long after completion before Payment Service actually pays
+// out, giving the poster a window to file a complaint (see Payment Service's hold-sweep)
+const PAYOUT_HOLD_WINDOW_MINS = 30;
 
 // the resolver sees their own attribution-tagged join link (so Daily can measure their real
 // attendance); everyone else -- the poster, or a booking list mixing both roles -- sees the
@@ -417,15 +420,7 @@ export function buildApp(
       return reply.code(404).send({ error: "booking not found" });
     }
 
-    // stats update degrades gracefully -- see stats/client.ts's comment. never let this block
-    // or fail the completion itself.
-    try {
-      await statsClient.incrementMinutesResolved(booking.resolverUserId, booking.durationMins);
-    } catch (err) {
-      request.log.warn({ bookingId: booking.id, err }, "stats update failed, booking still completed");
-    }
-
-    // same graceful-degradation rule as stats -- tearing down the room is cleanup, not a
+    // same graceful-degradation rule as stats below -- tearing down the room is cleanup, not a
     // reason to fail a completion that already happened
     if (booking.providerRoomId) {
       try {
@@ -435,9 +430,10 @@ export function buildApp(
       }
     }
 
-    // attendance-gated payout: the resolver only gets paid if they actually attended at least
-    // 90% of the booked duration. A failed/missing attendance lookup fails safe to 0 attended
-    // seconds -- never release a payout on an unverified number.
+    // under-time discount rule: a resolver who didn't actually attend at least 90% of the
+    // booked duration gets neither the minutesResolved credit nor the payout. A failed/missing
+    // attendance lookup fails safe to 0 attended seconds -- never credit or pay on an unverified
+    // number.
     let attendedSeconds = 0;
     if (booking.providerRoomId) {
       try {
@@ -448,10 +444,28 @@ export function buildApp(
     }
     const attendanceRatio = booking.durationMins > 0 ? attendedSeconds / (booking.durationMins * 60) : 0;
     await resolutionRepository.setBookingAttendance(booking.id, attendedSeconds, attendanceRatio);
+    const attendedEnough = attendanceRatio >= MIN_ATTENDANCE_RATIO;
+
+    // stats update degrades gracefully -- see stats/client.ts's comment. never let this block
+    // or fail the completion itself. Skipped entirely under the discount rule above.
+    if (attendedEnough) {
+      try {
+        await statsClient.incrementMinutesResolved(booking.resolverUserId, booking.durationMins);
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "stats update failed, booking still completed");
+      }
+    }
 
     if (booking.paymentId) {
       try {
-        await paymentClient.releasePayout(booking.paymentId, attendanceRatio >= MIN_ATTENDANCE_RATIO ? "release" : "withhold");
+        if (attendedEnough) {
+          // released, not paid immediately -- Payment Service holds it for
+          // PAYOUT_HOLD_WINDOW_MINS so a poster's complaint filed in that window can still stop it
+          const holdUntil = new Date(Date.now() + PAYOUT_HOLD_WINDOW_MINS * 60_000).toISOString();
+          await paymentClient.releasePayout(booking.paymentId, "hold", holdUntil);
+        } else {
+          await paymentClient.releasePayout(booking.paymentId, "withhold");
+        }
       } catch (err) {
         request.log.warn({ bookingId: booking.id, err }, "releasing payout failed, booking still completed");
       }

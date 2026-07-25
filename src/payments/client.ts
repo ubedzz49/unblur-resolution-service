@@ -10,15 +10,16 @@ export interface CollectPaymentInput {
   recipientUserId: string;
 }
 
-export type PayoutDecision = "release" | "withhold";
+export type PayoutDecision = "release" | "withhold" | "hold";
 
 export interface PaymentClient {
   collectPayment(input: CollectPaymentInput): Promise<{ paymentId: string }>;
   refundPayment(paymentId: string): Promise<void>;
   // decides whether the resolver actually gets paid, based on real meeting attendance -- see the
   // booking-completion flow. Degrades gracefully on failure: a payout that never resolves either
-  // way just stays undecided rather than blocking the booking from completing.
-  releasePayout(paymentId: string, decision: PayoutDecision): Promise<void>;
+  // way just stays undecided rather than blocking the booking from completing. holdUntil is
+  // required (an ISO date string) when decision is "hold", ignored otherwise.
+  releasePayout(paymentId: string, decision: PayoutDecision, holdUntil?: string): Promise<void>;
 }
 
 const REQUEST_TIMEOUT_MS = 2000;
@@ -79,7 +80,7 @@ export class HttpPaymentClient implements PaymentClient {
     }
   }
 
-  async releasePayout(paymentId: string, decision: PayoutDecision): Promise<void> {
+  async releasePayout(paymentId: string, decision: PayoutDecision, holdUntil?: string): Promise<void> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
@@ -90,7 +91,7 @@ export class HttpPaymentClient implements PaymentClient {
           "content-type": "application/json",
           "X-Internal-Service-Token": this.internalToken,
         },
-        body: JSON.stringify({ decision }),
+        body: JSON.stringify({ decision, holdUntil }),
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -106,7 +107,7 @@ export class HttpPaymentClient implements PaymentClient {
 export class FakePaymentClient implements PaymentClient {
   public collectCalls: CollectPaymentInput[] = [];
   public refundCalls: string[] = [];
-  public releasePayoutCalls: { paymentId: string; decision: PayoutDecision }[] = [];
+  public releasePayoutCalls: { paymentId: string; decision: PayoutDecision; holdUntil?: string }[] = [];
   private nextPaymentId = 1;
 
   async collectPayment(input: CollectPaymentInput): Promise<{ paymentId: string }> {
@@ -118,7 +119,7 @@ export class FakePaymentClient implements PaymentClient {
     this.refundCalls.push(paymentId);
   }
 
-  async releasePayout(paymentId: string, decision: PayoutDecision): Promise<void> {
-    this.releasePayoutCalls.push({ paymentId, decision });
+  async releasePayout(paymentId: string, decision: PayoutDecision, holdUntil?: string): Promise<void> {
+    this.releasePayoutCalls.push({ paymentId, decision, holdUntil });
   }
 }
