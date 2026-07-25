@@ -10,9 +10,15 @@ export interface CollectPaymentInput {
   recipientUserId: string;
 }
 
+export type PayoutDecision = "release" | "withhold";
+
 export interface PaymentClient {
   collectPayment(input: CollectPaymentInput): Promise<{ paymentId: string }>;
   refundPayment(paymentId: string): Promise<void>;
+  // decides whether the resolver actually gets paid, based on real meeting attendance -- see the
+  // booking-completion flow. Degrades gracefully on failure: a payout that never resolves either
+  // way just stays undecided rather than blocking the booking from completing.
+  releasePayout(paymentId: string, decision: PayoutDecision): Promise<void>;
 }
 
 const REQUEST_TIMEOUT_MS = 2000;
@@ -72,12 +78,35 @@ export class HttpPaymentClient implements PaymentClient {
       clearTimeout(timeout);
     }
   }
+
+  async releasePayout(paymentId: string, decision: PayoutDecision): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const url = new URL(`/internal/payments/${paymentId}/release-payout`, this.baseUrl);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Internal-Service-Token": this.internalToken,
+        },
+        body: JSON.stringify({ decision }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`payment service returned ${res.status} releasing payout`);
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 // test-only
 export class FakePaymentClient implements PaymentClient {
   public collectCalls: CollectPaymentInput[] = [];
   public refundCalls: string[] = [];
+  public releasePayoutCalls: { paymentId: string; decision: PayoutDecision }[] = [];
   private nextPaymentId = 1;
 
   async collectPayment(input: CollectPaymentInput): Promise<{ paymentId: string }> {
@@ -87,5 +116,9 @@ export class FakePaymentClient implements PaymentClient {
 
   async refundPayment(paymentId: string): Promise<void> {
     this.refundCalls.push(paymentId);
+  }
+
+  async releasePayout(paymentId: string, decision: PayoutDecision): Promise<void> {
+    this.releasePayoutCalls.push({ paymentId, decision });
   }
 }

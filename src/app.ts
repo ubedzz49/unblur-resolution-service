@@ -18,6 +18,18 @@ import {
 } from "./resolution/repository.js";
 
 const MAX_DURATION_MINS = 480;
+// under this attendance ratio (see the design doc's anti-gaming rules), a resolver's payout is
+// withheld rather than released -- prevents a resolver from banking paid minutes for a session
+// they barely attended
+const MIN_ATTENDANCE_RATIO = 0.9;
+
+// the resolver sees their own attribution-tagged join link (so Daily can measure their real
+// attendance); everyone else -- the poster, or a booking list mixing both roles -- sees the
+// plain, anonymous room link. The stored resolverJoinUrl/joinUrl fields never leave this service.
+function serializeBooking(booking: Booking, callerUserId: string) {
+  const { resolverJoinUrl, ...rest } = booking;
+  return { ...rest, joinUrl: callerUserId === booking.resolverUserId ? resolverJoinUrl ?? booking.joinUrl : booking.joinUrl };
+}
 
 interface CreateRequestBody {
   doubtId?: string;
@@ -254,9 +266,33 @@ export function buildApp(
         referenceId: booking.id,
         durationMins: resolutionRequest.durationMins,
       });
-      const withMeeting = await resolutionRepository.setBookingMeetingInfo(booking.id, room.providerRoomId, room.joinUrl);
 
-      const finalBooking = withMeeting ?? { ...(withPayment ?? { ...booking, paymentId }), providerRoomId: room.providerRoomId, joinUrl: room.joinUrl };
+      // tags the resolver's join link with their user id so their real attendance can be
+      // attributed to them later -- this is allowed to degrade gracefully (fall back to the
+      // plain, anonymous joinUrl) since a missing attribution just means attendance reads as 0
+      // at completion time, which safely defaults the payout decision to "withhold"
+      let resolverJoinUrl = room.joinUrl;
+      try {
+        resolverJoinUrl = await meetingClient.mintJoinToken(
+          room.providerRoomId,
+          room.joinUrl,
+          resolutionRequest.resolverUserId,
+          room.expiresAt,
+        );
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "minting resolver join token failed, falling back to plain joinUrl");
+      }
+
+      const withMeeting = await resolutionRepository.setBookingMeetingInfo(
+        booking.id,
+        room.providerRoomId,
+        room.joinUrl,
+        resolverJoinUrl,
+      );
+
+      const finalBooking =
+        withMeeting ??
+        { ...(withPayment ?? { ...booking, paymentId }), providerRoomId: room.providerRoomId, joinUrl: room.joinUrl, resolverJoinUrl };
 
       try {
         await notificationClient.notify({
@@ -332,7 +368,7 @@ export function buildApp(
       return reply.code(403).send({ error: "not authorized to view this booking" });
     }
 
-    return reply.send(booking);
+    return reply.send(serializeBooking(booking, callerUserId));
   });
 
   app.get<{ Querystring: ListBookingsQuery }>("/bookings/my", async (request, reply) => {
@@ -354,7 +390,7 @@ export function buildApp(
     if (status) filters.status = status as BookingStatus;
 
     const bookings = await resolutionRepository.listBookings(filters);
-    return reply.send(bookings);
+    return reply.send(bookings.map((b) => serializeBooking(b, callerUserId)));
   });
 
   app.post<{ Params: { id: string } }>("/bookings/:id/complete", async (request, reply) => {
@@ -377,6 +413,9 @@ export function buildApp(
     }
 
     const updated = await resolutionRepository.completeBooking(booking.id);
+    if (!updated) {
+      return reply.code(404).send({ error: "booking not found" });
+    }
 
     // stats update degrades gracefully -- see stats/client.ts's comment. never let this block
     // or fail the completion itself.
@@ -396,6 +435,28 @@ export function buildApp(
       }
     }
 
+    // attendance-gated payout: the resolver only gets paid if they actually attended at least
+    // 90% of the booked duration. A failed/missing attendance lookup fails safe to 0 attended
+    // seconds -- never release a payout on an unverified number.
+    let attendedSeconds = 0;
+    if (booking.providerRoomId) {
+      try {
+        attendedSeconds = await meetingClient.getAttendedSeconds(booking.providerRoomId, booking.resolverUserId);
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "attendance lookup failed, treating as 0 attended seconds");
+      }
+    }
+    const attendanceRatio = booking.durationMins > 0 ? attendedSeconds / (booking.durationMins * 60) : 0;
+    await resolutionRepository.setBookingAttendance(booking.id, attendedSeconds, attendanceRatio);
+
+    if (booking.paymentId) {
+      try {
+        await paymentClient.releasePayout(booking.paymentId, attendanceRatio >= MIN_ATTENDANCE_RATIO ? "release" : "withhold");
+      } catch (err) {
+        request.log.warn({ bookingId: booking.id, err }, "releasing payout failed, booking still completed");
+      }
+    }
+
     for (const userId of [booking.posterUserId, booking.resolverUserId]) {
       try {
         await notificationClient.notify({
@@ -411,7 +472,7 @@ export function buildApp(
     }
 
     request.log.info({ bookingId: booking.id }, "booking completed");
-    return reply.send(updated);
+    return reply.send(serializeBooking({ ...updated, attendedSeconds, attendanceRatio }, callerUserId));
   });
 
   app.post<{ Params: { id: string }; Body: RateBookingBody }>("/bookings/:id/rate", async (request, reply) => {

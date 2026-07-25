@@ -437,6 +437,52 @@ describe("POST /resolution-requests/:id/accept", () => {
     expect(listRes.json()[0].joinUrl).toBe(booking.joinUrl);
   });
 
+  it("mints a resolver-specific join token, and only the resolver sees the tagged link", async () => {
+    const { app, meetingClient } = setup();
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+    const acceptRes = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    const booking = acceptRes.json();
+    expect(meetingClient.mintTokenCalls).toEqual([{ providerRoomId: booking.providerRoomId, userId: RESOLVER }]);
+
+    const posterView = await app.inject({ method: "GET", url: `/bookings/${booking.id}`, headers: { "x-user-id": POSTER } });
+    expect(posterView.json().joinUrl).toBe(booking.joinUrl);
+
+    const resolverView = await app.inject({ method: "GET", url: `/bookings/${booking.id}`, headers: { "x-user-id": RESOLVER } });
+    expect(resolverView.json().joinUrl).toBe(`${booking.joinUrl}?t=fake-token-${RESOLVER}`);
+    expect(resolverView.json().joinUrl).not.toBe(posterView.json().joinUrl);
+  });
+
+  it("falls back to the plain joinUrl for the resolver if minting a join token fails, without failing accept", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const meetingClient = new FakeMeetingClient();
+    meetingClient.mintJoinToken = async () => {
+      throw new Error("meeting service unreachable");
+    };
+    const app = buildApp(repo, doubtClient, new FakePaymentClient(), new FakeStatsClient(), meetingClient, new FakeNotificationClient());
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    expect(res.statusCode).toBe(200);
+    const booking = res.json();
+
+    const resolverView = await app.inject({ method: "GET", url: `/bookings/${booking.id}`, headers: { "x-user-id": RESOLVER } });
+    expect(resolverView.json().joinUrl).toBe(booking.joinUrl);
+  });
+
   it("fails cleanly (no silent booking-without-a-room) when meeting room creation throws", async () => {
     const repo = new InMemoryResolutionRepository();
     const doubtClient = new FakeDoubtClient();
@@ -983,6 +1029,81 @@ describe("POST /bookings/:id/complete", () => {
       headers: { "x-user-id": POSTER },
     });
     expect(res.statusCode).toBe(409);
+  });
+
+  it("releases the payout when the resolver attended at least 90% of the booked duration", async () => {
+    const { app, paymentClient, meetingClient } = setup();
+    const booking = await acceptAndBook(app);
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, Math.ceil(booking.durationMins * 60 * 0.9));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().attendanceRatio).toBeGreaterThanOrEqual(0.9);
+    expect(paymentClient.releasePayoutCalls).toEqual([{ paymentId: booking.paymentId, decision: "release" }]);
+  });
+
+  it("withholds the payout when the resolver attended under 90% of the booked duration", async () => {
+    const { app, paymentClient, meetingClient } = setup();
+    const booking = await acceptAndBook(app);
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, Math.floor(booking.durationMins * 60 * 0.5));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().attendanceRatio).toBeLessThan(0.9);
+    expect(paymentClient.releasePayoutCalls).toEqual([{ paymentId: booking.paymentId, decision: "withhold" }]);
+  });
+
+  it("withholds (fails safe) when the attendance lookup itself throws, rather than releasing on an unverified number", async () => {
+    const { repo, doubtClient } = (() => {
+      const repo = new InMemoryResolutionRepository();
+      const doubtClient = new FakeDoubtClient();
+      doubtClient.seed(openDoubt());
+      return { repo, doubtClient };
+    })();
+    const paymentClient = new FakePaymentClient();
+    const meetingClient = new FakeMeetingClient();
+    meetingClient.getAttendedSeconds = async () => {
+      throw new Error("meeting service unreachable");
+    };
+    const app = buildApp(repo, doubtClient, paymentClient, new FakeStatsClient(), meetingClient, new FakeNotificationClient());
+    const booking = await acceptAndBook(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().attendanceRatio).toBe(0);
+    expect(paymentClient.releasePayoutCalls).toEqual([{ paymentId: booking.paymentId, decision: "withhold" }]);
+  });
+
+  it("a payout-release failure does NOT block booking completion", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const paymentClient = new FakePaymentClient();
+    paymentClient.releasePayout = async () => {
+      throw new Error("payment service unreachable");
+    };
+    const app = buildApp(repo, doubtClient, paymentClient, new FakeStatsClient(), new FakeMeetingClient(), new FakeNotificationClient());
+    const booking = await acceptAndBook(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("completed");
   });
 
   it("a stats client failure does NOT block booking completion (deliberate asymmetry vs. doubt/payment clients)", async () => {

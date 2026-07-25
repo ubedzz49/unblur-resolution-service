@@ -34,6 +34,11 @@ export interface Booking {
   paymentId: string | null;
   providerRoomId: string | null;
   joinUrl: string | null;
+  // resolver-specific join link, tagged with their user id so Daily can attribute their session
+  // to them -- the plain joinUrl above stays anonymous and is what the poster uses
+  resolverJoinUrl: string | null;
+  attendedSeconds: number | null;
+  attendanceRatio: number | null;
   status: BookingStatus;
   completedAt: string | null;
   createdAt: string;
@@ -106,7 +111,13 @@ export interface ResolutionRepository {
   acceptRequest(requestId: string, chosenSlot: string, booking: CreateBookingInput): Promise<Booking>;
   rejectRequest(id: string): Promise<ResolutionRequest | null>;
   setBookingPaymentId(bookingId: string, paymentId: string): Promise<Booking | null>;
-  setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null>;
+  setBookingMeetingInfo(
+    bookingId: string,
+    providerRoomId: string,
+    joinUrl: string,
+    resolverJoinUrl: string,
+  ): Promise<Booking | null>;
+  setBookingAttendance(bookingId: string, attendedSeconds: number, attendanceRatio: number): Promise<Booking | null>;
   getBookingById(id: string): Promise<Booking | null>;
   listBookings(filters: BookingFilters): Promise<Booking[]>;
   completeBooking(id: string): Promise<Booking | null>;
@@ -187,6 +198,9 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
       paymentId: null,
       providerRoomId: null,
       joinUrl: null,
+      resolverJoinUrl: null,
+      attendedSeconds: null,
+      attendanceRatio: null,
       status: "scheduled",
       completedAt: null,
       createdAt: now,
@@ -211,10 +225,23 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
     return updated;
   }
 
-  async setBookingMeetingInfo(bookingId: string, providerRoomId: string, joinUrl: string): Promise<Booking | null> {
+  async setBookingMeetingInfo(
+    bookingId: string,
+    providerRoomId: string,
+    joinUrl: string,
+    resolverJoinUrl: string,
+  ): Promise<Booking | null> {
     const existing = this.bookings.get(bookingId);
     if (!existing) return null;
-    const updated: Booking = { ...existing, providerRoomId, joinUrl };
+    const updated: Booking = { ...existing, providerRoomId, joinUrl, resolverJoinUrl };
+    this.bookings.set(bookingId, updated);
+    return updated;
+  }
+
+  async setBookingAttendance(bookingId: string, attendedSeconds: number, attendanceRatio: number): Promise<Booking | null> {
+    const existing = this.bookings.get(bookingId);
+    if (!existing) return null;
+    const updated: Booking = { ...existing, attendedSeconds, attendanceRatio };
     this.bookings.set(bookingId, updated);
     return updated;
   }
