@@ -4,6 +4,7 @@ import { FakePaymentClient, PaymentClient } from "./payments/client.js";
 import { FakeStatsClient, StatsClient } from "./stats/client.js";
 import { FakeMeetingClient, MeetingClient } from "./meetings/client.js";
 import { FakeNotificationClient, NotificationClient } from "./notifications/client.js";
+import { AiNotesClient, FakeAiNotesClient } from "./ai-notes/client.js";
 import {
   Booking,
   BookingFilters,
@@ -71,6 +72,7 @@ export function buildApp(
   statsClient: StatsClient = new FakeStatsClient(),
   meetingClient: MeetingClient = new FakeMeetingClient(),
   notificationClient: NotificationClient = new FakeNotificationClient(),
+  aiNotesClient: AiNotesClient = new FakeAiNotesClient(),
 ): FastifyInstance {
   const app = Fastify({
     logger: process.env.NODE_ENV === "test" ? false : { level: process.env.LOG_LEVEL ?? "info" },
@@ -491,6 +493,12 @@ export function buildApp(
         request.log.warn({ bookingId: booking.id, userId, err }, "notification failed, booking still completed");
       }
     }
+
+    // fire-and-forget -- notes generation runs regardless of attendance/payout outcome, and a
+    // failure here is never a reason to hold up or revert a completion that already happened
+    aiNotesClient
+      .trigger("booking", booking.id, [booking.posterUserId, booking.resolverUserId], booking.providerRoomId ?? undefined)
+      .catch((err) => request.log.warn({ bookingId: booking.id, err }, "ai notes trigger failed, booking still completed"));
 
     request.log.info({ bookingId: booking.id }, "booking completed");
     return reply.send(serializeBooking({ ...updated, attendedSeconds, attendanceRatio }, callerUserId));

@@ -10,6 +10,7 @@ import {
   ThrowingEndMeetingClient,
 } from "./meetings/client.js";
 import { FakeNotificationClient, NotificationClient, ThrowingNotificationClient } from "./notifications/client.js";
+import { FakeAiNotesClient, ThrowingAiNotesClient } from "./ai-notes/client.js";
 import { InMemoryResolutionRepository } from "./resolution/repository.js";
 
 const POSTER = "11111111-1111-1111-1111-111111111111";
@@ -48,8 +49,9 @@ function setup(opts: { doubt?: Doubt | null } = {}) {
   const statsClient = new FakeStatsClient();
   const meetingClient = new FakeMeetingClient();
   const notificationClient = new FakeNotificationClient();
-  const app = buildApp(repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient);
-  return { app, repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient };
+  const aiNotesClient = new FakeAiNotesClient();
+  const app = buildApp(repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient, aiNotesClient);
+  return { app, repo, doubtClient, paymentClient, statsClient, meetingClient, notificationClient, aiNotesClient };
 }
 
 const validCreateBody = () => ({
@@ -1160,6 +1162,62 @@ describe("POST /bookings/:id/complete", () => {
     });
     expect(res.statusCode).toBe(200);
     expect(statsClient.calls).toEqual([]);
+  });
+
+  it("triggers ai notes for both participants on completion", async () => {
+    const { app, aiNotesClient } = setup();
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(aiNotesClient.calls).toEqual([
+      {
+        referenceType: "booking",
+        referenceId: booking.id,
+        participantUserIds: [POSTER, RESOLVER],
+        providerRoomId: booking.providerRoomId,
+      },
+    ]);
+  });
+
+  it("still triggers ai notes even when attendance is under the 90% threshold (runs outside the attendance gate)", async () => {
+    const { app, aiNotesClient, meetingClient } = setup();
+    const booking = await acceptAndBook(app);
+    meetingClient.attendedSecondsByRoom.set(booking.providerRoomId, Math.floor(booking.durationMins * 60 * 0.5));
+
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(aiNotesClient.calls).toHaveLength(1);
+  });
+
+  it("an ai notes trigger failure does NOT block booking completion", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      new FakeNotificationClient(),
+      new ThrowingAiNotesClient(),
+    );
+    const booking = await acceptAndBook(app);
+    const res = await app.inject({
+      method: "POST",
+      url: `/bookings/${booking.id}/complete`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("completed");
   });
 });
 
