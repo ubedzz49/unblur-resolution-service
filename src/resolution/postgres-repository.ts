@@ -201,6 +201,27 @@ export class PostgresResolutionRepository implements ResolutionRepository {
     }
   }
 
+  async revertAcceptedRequest(requestId: string, bookingId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // booking first -- bookings.resolution_request_id has no FK action to worry about here,
+      // but deleting it before flipping the request back to pending keeps the two writes in the
+      // same order as acceptRequest's own (request, then booking), just reversed
+      await client.query("DELETE FROM bookings WHERE id = $1", [bookingId]);
+      await client.query(
+        `UPDATE resolution_requests SET status = 'pending', accepted_slot_at = NULL, updated_at = now() WHERE id = $1`,
+        [requestId],
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async rejectRequest(id: string): Promise<ResolutionRequest | null> {
     const result = await this.pool.query<RequestRow>(
       `UPDATE resolution_requests SET status = 'rejected', updated_at = now() WHERE id = $1 RETURNING *`,

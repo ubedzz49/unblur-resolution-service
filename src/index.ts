@@ -8,6 +8,7 @@ import { HttpStatsClient } from "./stats/client.js";
 import { HttpMeetingClient } from "./meetings/client.js";
 import { HttpNotificationClient } from "./notifications/client.js";
 import { HttpAiNotesClient } from "./ai-notes/client.js";
+import { HttpUserClient } from "./users/client.js";
 import { logger } from "./logger.js";
 
 const port = Number(process.env.PORT ?? 3005);
@@ -32,6 +33,7 @@ runMigrations(dbPool)
       new HttpNotificationClient(),
       new HttpAiNotesClient(),
       process.env.INTERNAL_SERVICE_TOKEN,
+      new HttpUserClient(),
     );
     return app.listen({ port, host: "0.0.0.0" }).then(() => app.log.info({ port }, "resolution-service listening"));
   })

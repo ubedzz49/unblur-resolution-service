@@ -13,6 +13,10 @@ export interface Doubt {
 export interface DoubtClient {
   getDoubt(id: string): Promise<Doubt | null>;
   closeDoubt(id: string): Promise<void>;
+  // compensating action when accept succeeds at the DB layer but a downstream step (payment,
+  // meeting room) then fails -- see revertAcceptedRequest. Never throws on "already open" (the
+  // route is idempotent); real failures still throw, same as every other method here.
+  reopenDoubt(id: string): Promise<void>;
 }
 
 const REQUEST_TIMEOUT_MS = 2000;
@@ -22,9 +26,11 @@ const REQUEST_TIMEOUT_MS = 2000;
 // failure here throws and the caller returns a real error rather than proceeding silently
 export class HttpDoubtClient implements DoubtClient {
   private baseUrl: string;
+  private internalToken: string;
 
-  constructor(baseUrl = process.env.DOUBT_SERVICE_URL ?? "") {
+  constructor(baseUrl = process.env.DOUBT_SERVICE_URL ?? "", internalToken = process.env.INTERNAL_SERVICE_TOKEN ?? "") {
     this.baseUrl = baseUrl;
+    this.internalToken = internalToken;
   }
 
   async getDoubt(id: string): Promise<Doubt | null> {
@@ -50,12 +56,30 @@ export class HttpDoubtClient implements DoubtClient {
       const url = new URL(`/doubts/${id}/status`, this.baseUrl);
       const res = await fetch(url, {
         method: "PATCH",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "X-Internal-Service-Token": this.internalToken },
         body: JSON.stringify({ status: "closed" }),
         signal: controller.signal,
       });
       if (!res.ok) {
         throw new Error(`doubt service returned ${res.status} closing doubt`);
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async reopenDoubt(id: string): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const url = new URL(`/doubts/${id}/reopen`, this.baseUrl);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "X-Internal-Service-Token": this.internalToken },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw new Error(`doubt service returned ${res.status} reopening doubt`);
       }
     } finally {
       clearTimeout(timeout);
@@ -79,6 +103,13 @@ export class FakeDoubtClient implements DoubtClient {
     const existing = this.doubts.get(id);
     if (existing) {
       this.doubts.set(id, { ...existing, status: "closed" });
+    }
+  }
+
+  async reopenDoubt(id: string): Promise<void> {
+    const existing = this.doubts.get(id);
+    if (existing) {
+      this.doubts.set(id, { ...existing, status: "open" });
     }
   }
 }

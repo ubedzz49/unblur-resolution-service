@@ -6,6 +6,7 @@ import { FakeStatsClient, StatsClient } from "./stats/client.js";
 import { FakeMeetingClient, MeetingClient } from "./meetings/client.js";
 import { FakeNotificationClient, NotificationClient } from "./notifications/client.js";
 import { AiNotesClient, FakeAiNotesClient } from "./ai-notes/client.js";
+import { FakeUserClient, UserClient } from "./users/client.js";
 import {
   Booking,
   BookingFilters,
@@ -31,6 +32,12 @@ const PAYOUT_HOLD_WINDOW_MINS = 30;
 // the resolver sees their own attribution-tagged join link (so Daily can measure their real
 // attendance); everyone else -- the poster, or a booking list mixing both roles -- sees the
 // plain, anonymous room link. The stored resolverJoinUrl/joinUrl fields never leave this service.
+// no currency-formatting convention exists elsewhere in this codebase yet -- same plain rupee
+// string Payment Service uses for its own notification copy
+function formatAmount(amountCents: number): string {
+  return `₹${(amountCents / 100).toFixed(2)}`;
+}
+
 function serializeBooking(booking: Booking, callerUserId: string) {
   const { resolverJoinUrl, ...rest } = booking;
   return { ...rest, joinUrl: callerUserId === booking.resolverUserId ? resolverJoinUrl ?? booking.joinUrl : booking.joinUrl };
@@ -75,6 +82,7 @@ export function buildApp(
   notificationClient: NotificationClient = new FakeNotificationClient(),
   aiNotesClient: AiNotesClient = new FakeAiNotesClient(),
   internalServiceToken: string | undefined = process.env.INTERNAL_SERVICE_TOKEN,
+  userClient: UserClient = new FakeUserClient(),
 ): FastifyInstance {
   const app = Fastify(
     process.env.NODE_ENV === "test"
@@ -203,6 +211,18 @@ export function buildApp(
       amountCents,
       proposedSlots: validSlots,
     });
+    // best-effort enrichment -- a notification with the resolver's real name and the doubt's
+    // title is far more useful than a bare "someone sent a request", but a lookup failure here
+    // must never block request creation, same "degrades gracefully" rule as the notify() call
+    // itself right below
+    let resolverName = "Someone";
+    try {
+      const [resolver] = await userClient.getUsersByIds([callerUserId]);
+      if (resolver?.name) resolverName = resolver.name;
+    } catch (err) {
+      request.log.warn({ requestId: created.id, err }, "resolver name lookup failed, using generic notification copy");
+    }
+
     try {
       await notificationClient.notify({
         userId: doubt.authorUserId,
@@ -210,7 +230,7 @@ export function buildApp(
         referenceType: "resolutionRequest",
         referenceId: created.id,
         title: "New resolution request",
-        body: "Someone sent a resolution request for your doubt",
+        body: `${resolverName} wants to resolve "${doubt.title}" -- ${durationMins} min for ${formatAmount(amountCents)}`,
       });
     } catch (err) {
       request.log.warn({ requestId: created.id, err }, "notification failed, request still created");
@@ -233,6 +253,30 @@ export function buildApp(
 
     const requests = await resolutionRepository.listRequests(filters);
     return reply.send(requests);
+  });
+
+  // single-item lookup, primarily for the notifications UI -- a "new resolution request"
+  // notification only carries a referenceId, so the accept/decline action there needs to fetch
+  // the full request (proposedSlots, amountCents, durationMins, doubtId) to render anything
+  // useful, rather than forcing the user over to the doubt's own page first.
+  app.get<{ Params: { id: string } }>("/resolution-requests/:id", async (request, reply) => {
+    const callerUserId = requireUserId(request);
+    if (!callerUserId) {
+      return reply.code(401).send({ error: "missing X-User-Id header" });
+    }
+
+    const resolutionRequest = await resolutionRepository.getRequestById(request.params.id);
+    if (!resolutionRequest) {
+      return reply.code(404).send({ error: "resolution request not found" });
+    }
+
+    const doubt = await doubtClient.getDoubt(resolutionRequest.doubtId);
+    // only the doubt's author or the resolver who sent it may view a single request this way
+    if (!doubt || (doubt.authorUserId !== callerUserId && resolutionRequest.resolverUserId !== callerUserId)) {
+      return reply.code(403).send({ error: "not authorized to view this resolution request" });
+    }
+
+    return reply.send({ ...resolutionRequest, doubtTitle: doubt.title });
   });
 
   app.post<{ Params: { id: string }; Body: AcceptRequestBody }>(
@@ -293,52 +337,69 @@ export function buildApp(
 
       await doubtClient.closeDoubt(resolutionRequest.doubtId);
 
-      // payment happens after the DB transaction commits -- a payment failure here means the
-      // booking exists but unpaid, which the caller must see as a real error, not silently ignore
-      const { paymentId } = await paymentClient.collectPayment({
-        userId: callerUserId,
-        amountCents: resolutionRequest.amountCents,
-        type: "resolution",
-        referenceType: "booking",
-        referenceId: booking.id,
-        recipientUserId: booking.resolverUserId,
-      });
-      const withPayment = await resolutionRepository.setBookingPaymentId(booking.id, paymentId);
-
-      // meeting room creation follows the same "no silent fallback" rule as payment collection --
-      // a booking with no real room is a real problem, so this throws and the whole accept fails
-      // rather than returning a booking with no joinUrl
-      const room = await meetingClient.createRoom({
-        referenceId: booking.id,
-        durationMins: resolutionRequest.durationMins,
-      });
-
-      // tags the resolver's join link with their user id so their real attendance can be
-      // attributed to them later -- this is allowed to degrade gracefully (fall back to the
-      // plain, anonymous joinUrl) since a missing attribution just means attendance reads as 0
-      // at completion time, which safely defaults the payout decision to "withhold"
-      let resolverJoinUrl = room.joinUrl;
+      // Everything from here on (payment collection, meeting room creation) is a real external
+      // call that can fail. It used to be allowed to just throw and 500 straight out of this
+      // handler -- but by that point the request was already marked accepted, the booking
+      // already existed, and the doubt was already closed, so a mid-flow failure left the poster
+      // stuck: the doubt looked closed, yet accept/decline both 409'd on retry since the request
+      // was no longer 'pending'. Now any failure here is caught and fully compensated -- the
+      // booking is deleted, the request goes back to 'pending', and the doubt reopens -- so the
+      // poster sees a clear error and can simply try accepting again.
+      let finalBooking: Booking;
       try {
-        resolverJoinUrl = await meetingClient.mintJoinToken(
+        const { paymentId } = await paymentClient.collectPayment({
+          userId: callerUserId,
+          amountCents: resolutionRequest.amountCents,
+          type: "resolution",
+          referenceType: "booking",
+          referenceId: booking.id,
+          recipientUserId: booking.resolverUserId,
+        });
+        const withPayment = await resolutionRepository.setBookingPaymentId(booking.id, paymentId);
+
+        const room = await meetingClient.createRoom({
+          referenceId: booking.id,
+          durationMins: resolutionRequest.durationMins,
+        });
+
+        // tags the resolver's join link with their user id so their real attendance can be
+        // attributed to them later -- this is allowed to degrade gracefully (fall back to the
+        // plain, anonymous joinUrl) since a missing attribution just means attendance reads as 0
+        // at completion time, which safely defaults the payout decision to "withhold"
+        let resolverJoinUrl = room.joinUrl;
+        try {
+          resolverJoinUrl = await meetingClient.mintJoinToken(
+            room.providerRoomId,
+            room.joinUrl,
+            resolutionRequest.resolverUserId,
+            room.expiresAt,
+          );
+        } catch (err) {
+          request.log.warn({ bookingId: booking.id, err }, "minting resolver join token failed, falling back to plain joinUrl");
+        }
+
+        const withMeeting = await resolutionRepository.setBookingMeetingInfo(
+          booking.id,
           room.providerRoomId,
           room.joinUrl,
-          resolutionRequest.resolverUserId,
-          room.expiresAt,
+          resolverJoinUrl,
         );
+
+        finalBooking =
+          withMeeting ??
+          { ...(withPayment ?? { ...booking, paymentId }), providerRoomId: room.providerRoomId, joinUrl: room.joinUrl, resolverJoinUrl };
       } catch (err) {
-        request.log.warn({ bookingId: booking.id, err }, "minting resolver join token failed, falling back to plain joinUrl");
+        request.log.error({ bookingId: booking.id, requestId: resolutionRequest.id, err }, "accept failed after booking was created -- rolling back");
+        try {
+          await resolutionRepository.revertAcceptedRequest(resolutionRequest.id, booking.id);
+          await doubtClient.reopenDoubt(resolutionRequest.doubtId);
+        } catch (rollbackErr) {
+          // the rollback itself failing is the one case this can't recover from cleanly --
+          // logged loudly since it needs a human, but the caller still gets a real error either way
+          request.log.error({ bookingId: booking.id, requestId: resolutionRequest.id, rollbackErr }, "rollback after failed accept also failed");
+        }
+        return reply.code(502).send({ error: "Couldn't finish accepting this request (payment or meeting setup failed). Please try again." });
       }
-
-      const withMeeting = await resolutionRepository.setBookingMeetingInfo(
-        booking.id,
-        room.providerRoomId,
-        room.joinUrl,
-        resolverJoinUrl,
-      );
-
-      const finalBooking =
-        withMeeting ??
-        { ...(withPayment ?? { ...booking, paymentId }), providerRoomId: room.providerRoomId, joinUrl: room.joinUrl, resolverJoinUrl };
 
       try {
         await notificationClient.notify({
@@ -347,6 +408,7 @@ export function buildApp(
           referenceType: "booking",
           referenceId: booking.id,
           title: "Your request was accepted",
+          body: `Your resolution request for "${doubt.title}" was accepted -- your session is booked.`,
         });
       } catch (err) {
         request.log.warn({ bookingId: booking.id, err }, "notification failed, booking still accepted");
@@ -390,6 +452,7 @@ export function buildApp(
         referenceType: "resolutionRequest",
         referenceId: resolutionRequest.id,
         title: "Your request was rejected",
+        body: `Your resolution request for "${doubt.title}" was declined.`,
       });
     } catch (err) {
       request.log.warn({ requestId: resolutionRequest.id, err }, "notification failed, request still rejected");

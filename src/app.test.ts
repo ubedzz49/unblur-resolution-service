@@ -11,6 +11,7 @@ import {
 } from "./meetings/client.js";
 import { FakeNotificationClient, NotificationClient, ThrowingNotificationClient } from "./notifications/client.js";
 import { FakeAiNotesClient, ThrowingAiNotesClient } from "./ai-notes/client.js";
+import { FakeUserClient, UserClient } from "./users/client.js";
 import { InMemoryResolutionRepository } from "./resolution/repository.js";
 
 const POSTER = "11111111-1111-1111-1111-111111111111";
@@ -123,6 +124,72 @@ describe("POST /resolution-requests", () => {
         referenceId: created.id,
       }),
     );
+  });
+
+  // Regression: notifications used to say only "Someone sent a resolution request for your
+  // doubt" -- no way to tell who, or for which doubt, without leaving the notification and
+  // hunting for it. Now it carries the resolver's real name, the doubt's title, and the terms.
+  it("enriches the notification body with the resolver's name, the doubt's title, and the terms", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt({ title: "why does this integral diverge" }));
+    const notificationClient = new FakeNotificationClient();
+    const userClient = new FakeUserClient();
+    userClient.usersById.set(RESOLVER, { id: RESOLVER, name: "Asha Verma" });
+    const app = buildApp(
+      new InMemoryResolutionRepository(),
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      notificationClient,
+      new FakeAiNotesClient(),
+      undefined,
+      userClient,
+    );
+    await app.inject({
+      method: "POST",
+      url: "/resolution-requests",
+      headers: { "x-user-id": RESOLVER },
+      payload: { doubtId: DOUBT_ID, durationMins: 30, amountCents: 25000, proposedSlots: [futureSlot()] },
+    });
+    const notification = notificationClient.calls.find((c) => c.type === "resolution_request_received");
+    expect(notification?.body).toContain("Asha Verma");
+    expect(notification?.body).toContain("why does this integral diverge");
+    expect(notification?.body).toContain("30 min");
+    expect(notification?.body).toContain("₹250.00");
+  });
+
+  it("falls back to generic notification copy if the user lookup fails", async () => {
+    const repo = new InMemoryResolutionRepository();
+    const doubtClient = new FakeDoubtClient();
+    doubtClient.seed(openDoubt());
+    const notificationClient = new FakeNotificationClient();
+    const throwingUserClient: UserClient = {
+      getUsersByIds: async () => {
+        throw new Error("user service unreachable");
+      },
+    };
+    const app = buildApp(
+      repo,
+      doubtClient,
+      new FakePaymentClient(),
+      new FakeStatsClient(),
+      new FakeMeetingClient(),
+      notificationClient,
+      new FakeAiNotesClient(),
+      undefined,
+      throwingUserClient,
+    );
+    const res = await app.inject({
+      method: "POST",
+      url: "/resolution-requests",
+      headers: { "x-user-id": RESOLVER },
+      payload: validCreateBody(),
+    });
+    expect(res.statusCode).toBe(201);
+    const notification = notificationClient.calls.find((c) => c.type === "resolution_request_received");
+    expect(notification?.body).toContain("Someone");
   });
 
   it("a notification failure does NOT block request creation from succeeding", async () => {
@@ -365,6 +432,64 @@ describe("GET /resolution-requests", () => {
   });
 });
 
+describe("GET /resolution-requests/:id", () => {
+  it("returns the full request plus the doubt's title, for the doubt's author", async () => {
+    const { app } = setup();
+    const slot = futureSlot();
+    const created = await createPendingRequest(app, { proposedSlots: [slot] });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/resolution-requests/${created.id}`,
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.id).toBe(created.id);
+    expect(body.doubtTitle).toBe("why does this integral diverge");
+    expect(body.proposedSlots).toEqual([slot]);
+  });
+
+  it("returns it for the resolver who sent it too", async () => {
+    const { app } = setup();
+    const created = await createPendingRequest(app);
+    const res = await app.inject({
+      method: "GET",
+      url: `/resolution-requests/${created.id}`,
+      headers: { "x-user-id": RESOLVER },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("403s for anyone else", async () => {
+    const { app } = setup();
+    const created = await createPendingRequest(app);
+    const res = await app.inject({
+      method: "GET",
+      url: `/resolution-requests/${created.id}`,
+      headers: { "x-user-id": OTHER_USER },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("404s for a nonexistent id", async () => {
+    const { app } = setup();
+    const res = await app.inject({
+      method: "GET",
+      url: "/resolution-requests/00000000-0000-0000-0000-000000000000",
+      headers: { "x-user-id": POSTER },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("401s when the header is missing", async () => {
+    const { app } = setup();
+    const created = await createPendingRequest(app);
+    const res = await app.inject({ method: "GET", url: `/resolution-requests/${created.id}` });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 async function createPendingRequest(
   app: ReturnType<typeof buildApp>,
   overrides: Partial<ReturnType<typeof validCreateBody>> = {},
@@ -485,7 +610,7 @@ describe("POST /resolution-requests/:id/accept", () => {
     expect(resolverView.json().joinUrl).toBe(booking.joinUrl);
   });
 
-  it("fails cleanly (no silent booking-without-a-room) when meeting room creation throws", async () => {
+  it("fails cleanly (no silent booking-without-a-room) and rolls back when meeting room creation throws", async () => {
     const repo = new InMemoryResolutionRepository();
     const doubtClient = new FakeDoubtClient();
     doubtClient.seed(openDoubt());
@@ -506,7 +631,8 @@ describe("POST /resolution-requests/:id/accept", () => {
       headers: { "x-user-id": POSTER },
       payload: { chosenSlot: slot },
     });
-    expect(res.statusCode).toBe(500);
+    expect(res.statusCode).toBe(502);
+    expect((await repo.getRequestById(created.id))?.status).toBe("pending");
   });
 
   it("a notification failure does NOT block accept from succeeding", async () => {
@@ -676,6 +802,7 @@ describe("POST /resolution-requests/:id/accept", () => {
       closeDoubt: async () => {
         throw new Error("doubt service unreachable");
       },
+      reopenDoubt: async () => {},
     };
     const app = buildApp(repo, throwingDoubtClient, new FakePaymentClient(), new FakeStatsClient());
     const slot = futureSlot();
@@ -692,10 +819,17 @@ describe("POST /resolution-requests/:id/accept", () => {
     expect(res.statusCode).toBe(500);
   });
 
-  it("propagates a payment client failure as a real error rather than silently proceeding", async () => {
+  // Regression for a real incident: a payment failure used to 500 out of the handler leaving
+  // the request already marked accepted, the booking already created, and the doubt already
+  // closed -- so the poster saw a hard error, but then couldn't accept or decline the request
+  // again (409, "already accepted") and the doubt looked permanently closed on refresh. It must
+  // instead fully roll back: the request goes back to pending, the booking is gone, and the
+  // doubt reopens, so the poster can just try accepting again.
+  it("rolls back the accept (request back to pending, booking gone, doubt reopened) if payment collection fails", async () => {
     const repo = new InMemoryResolutionRepository();
     const doubtClient = new FakeDoubtClient();
-    doubtClient.seed(openDoubt());
+    const doubt = openDoubt();
+    doubtClient.seed(doubt);
     const throwingPaymentClient: PaymentClient = {
       collectPayment: async () => {
         throw new Error("payment service unreachable");
@@ -712,7 +846,26 @@ describe("POST /resolution-requests/:id/accept", () => {
       headers: { "x-user-id": POSTER },
       payload: { chosenSlot: slot },
     });
-    expect(res.statusCode).toBe(500);
+    // a clear, distinct error -- not a bare 500 -- so the frontend can tell the user to retry
+    expect(res.statusCode).toBe(502);
+
+    // the request is actionable again, not stuck in limbo
+    const reverted = await repo.getRequestById(created.id);
+    expect(reverted?.status).toBe("pending");
+
+    // the doubt reopened, so it no longer shows as permanently closed
+    const reopenedDoubt = await doubtClient.getDoubt(doubt.id);
+    expect(reopenedDoubt?.status).toBe("open");
+
+    // and a genuine retry (with a working payment client this time) succeeds cleanly
+    const retryApp = buildApp(repo, doubtClient, new FakePaymentClient(), new FakeStatsClient());
+    const retryRes = await retryApp.inject({
+      method: "POST",
+      url: `/resolution-requests/${created.id}/accept`,
+      headers: { "x-user-id": POSTER },
+      payload: { chosenSlot: slot },
+    });
+    expect(retryRes.statusCode).toBe(200);
   });
 });
 
