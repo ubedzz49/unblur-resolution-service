@@ -109,6 +109,11 @@ export interface ResolutionRepository {
   // moves a pending request to accepted + inserts the booking in one transaction; throws
   // DuplicateAcceptedRequestError if another request for the same doubt already won the race
   acceptRequest(requestId: string, chosenSlot: string, booking: CreateBookingInput): Promise<Booking>;
+  // compensating action for when accept succeeded at the DB layer but a downstream step
+  // (payment collection, meeting room creation) then failed -- deletes the booking and puts the
+  // request back to 'pending' in one transaction, so the poster can simply retry accepting
+  // instead of being left with a request stuck in a half-accepted state they can't act on.
+  revertAcceptedRequest(requestId: string, bookingId: string): Promise<void>;
   rejectRequest(id: string): Promise<ResolutionRequest | null>;
   setBookingPaymentId(bookingId: string, paymentId: string): Promise<Booking | null>;
   setBookingMeetingInfo(
@@ -207,6 +212,14 @@ export class InMemoryResolutionRepository implements ResolutionRepository {
     };
     this.bookings.set(booking.id, booking);
     return booking;
+  }
+
+  async revertAcceptedRequest(requestId: string, bookingId: string): Promise<void> {
+    this.bookings.delete(bookingId);
+    const existing = this.requests.get(requestId);
+    if (existing) {
+      this.requests.set(requestId, { ...existing, status: "pending", acceptedSlotAt: null, updatedAt: new Date().toISOString() });
+    }
   }
 
   async rejectRequest(id: string): Promise<ResolutionRequest | null> {
