@@ -23,7 +23,13 @@ export interface MeetingClient {
   getAttendedSeconds(providerRoomId: string, userId: string): Promise<number>;
 }
 
-const REQUEST_TIMEOUT_MS = 2000;
+// Real incident: meeting-service's own Lambda cold-start init alone has been observed taking
+// ~2.9s (confirmed via CloudWatch), so a 2s client-side timeout here could abort *before the
+// downstream Lambda even finishes initializing*, let alone calls Daily's API on top of that --
+// this genuinely broke real accepts in production, rolling back an otherwise-fine request purely
+// because of transient cold-start latency. 8s comfortably absorbs a cold start plus a real Daily
+// API round trip, while still failing well before a user would call it "stuck".
+const REQUEST_TIMEOUT_MS = 8000;
 
 // createRoom follows the same "no silent fallback" rule as PaymentClient/DoubtClient -- a
 // booking with no real meeting room is a real problem, so a failure here throws and the accept
