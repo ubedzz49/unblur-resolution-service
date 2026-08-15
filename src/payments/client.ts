@@ -22,7 +22,11 @@ export interface PaymentClient {
   releasePayout(paymentId: string, decision: PayoutDecision, holdUntil?: string): Promise<void>;
 }
 
-const REQUEST_TIMEOUT_MS = 2000;
+// same reasoning as meetings/client.ts's own bump -- a downstream Lambda cold start alone can
+// eat a real chunk of a 2s budget before the actual request is even handled, causing a spurious
+// abort and a needless accept-flow rollback. 8s gives real headroom for a cold start plus a
+// normal round trip.
+const REQUEST_TIMEOUT_MS = 8000;
 
 // same "no silent fallback" rule as HttpDoubtClient -- a booking without a real payment record,
 // or a cancel that silently fails to refund, is a real money problem. every failure here throws.
